@@ -1,258 +1,248 @@
 ---
 name: options-trading-pipeline
-description: Daily options trading report pipeline for short-term premium buying (call/put). Use when the user says "옵션 리포트", "daily options scan", "call put 제안", "premium trading", "weekly options picks". Screens 30 master tickers using technical analysis (MA, VWAP, MACD) via MCP market data tools, then identifies optimal call/put entry candidates with W+2/W+3/W+4 expirations.
+description: Daily options trading report for short-term premium buying (call/put). Use when the user says "옵션 리포트", "daily options scan", "call put 제안", "플로우 스캔", "weekly options picks". Uses Unusual Whales MCP (flow-first approach) + yfinance MCP to identify high-conviction directional plays with W+2/W+3/W+4 expirations. Target holding: under 1 week.
 metadata:
-  author: options-trading-pipeline
-  version: 1.0.0
+  author: bokangkim
+  version: 2.0.0
   category: trading
 ---
 
-# Options Trading Daily Report Pipeline
+# Options Trading Daily Pipeline
 
-You are a quantitative options trading analyst. Your job is to run a daily pipeline that screens 30 master tickers for short-term directional options plays (premium buying), targeting 1-week or less holding period with W+2, W+3, W+4 expirations.
+## 설계 원칙
 
-## MCP Tools Available
+**기술분석 먼저 (X)** → **플로우 먼저 (O)**
 
-| Tool | Usage in Pipeline |
-|------|-------------------|
-| `get_historical_stock_prices` | OHLCV for MA / MACD calculation |
-| `get_stock_info` | Beta, IV, analyst targets, short interest |
-| `get_option_expiration_dates` | Find W+2/W+3/W+4 expiry dates |
-| `get_option_chain` | Calls/puts chain — delta, IV, volume, OI |
-| `get_finance_news` | Earnings warnings, catalysts |
-| `get_recommendations` | Analyst upgrades/downgrades |
-| `KakaotalkChat-MemoChat` | Deliver report to KakaoTalk |
+시장은 스마트머니가 지금 어디 베팅하는지 스스로 알려준다.
+`get_flow_alerts` 한 번이 30종목 차트 분석 전부를 대체한다.
+GEX(델타 헷지 노출)가 주가의 실질 인력과 척력 레벨을 만든다.
 
----
+## MCP 구성
 
-## Master Ticker List (30 tickers)
-
-Managed in `references/ticker-master.md`. Default list:
-
-**Mega-cap Tech (liquid options):** AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA  
-**High-beta / Momentum:** AMD, MSTR, COIN, PLTR, SOFI, HOOD  
-**Index ETFs:** SPY, QQQ, IWM, SOXS, TQQQ  
-**Financials:** JPM, GS, BAC  
-**Energy / Industrial:** XOM, BA, CAT  
-**Consumer / Media:** NFLX, DIS, UBER, PYPL  
-**Biotech / Wildcard:** MRNA, SMCI
+| MCP | 역할 |
+|-----|------|
+| **Unusual Whales** (`api.unusualwhales.com/api/mcp`) | 주력: 플로우, GEX, 다크풀, 기술지표 |
+| **UsStockInfo** (yfinance) | 보조: 뉴스, 재무, 추천 |
+| **KakaotalkChat-MemoChat** | 리포트 발송 |
 
 ---
 
-## Pipeline Execution — Step by Step
+## 실행 순서 (7 Layers)
 
-### Step 1 — Technical Screening (run for all 30 tickers)
+### LAYER 0 — 시장 레짐 판단 (항상 먼저, 4 calls)
 
 ```
-get_historical_stock_prices(ticker, period="3mo", interval="1d")
+get_market_state()
+get_market_tide()
+get_greek_exposure_by_ticker("SPY")
+get_greek_exposure_by_ticker("QQQ")
 ```
 
-Calculate for each ticker:
-- **MA1** = latest close
-- **MA2** = 2-day SMA of close
-- **MA5** = 5-day SMA of close
-- **MA20** = 20-day SMA (trend filter)
-- **MACD** = EMA(12) − EMA(26), Signal = EMA(9) of MACD
-- **Momentum** = (close − close[5d ago]) / close[5d ago] × 100
+판정표:
 
-For intraday VWAP (if running during market hours):
+| GEX | Market Tide | 판정 |
+|-----|------------|------|
+| 음수 | BULLISH | CALL 풀사이즈 진입 |
+| 음수 | BEARISH | PUT 풀사이즈 진입 |
+| 양수 | 어느쪽이든 | 사이즈 50% 축소 |
+| — | VIX > 35 | 전체 보류 |
+
+GEX 음수 = 마켓메이커 같은 방향 헷지 = 방향성 폭발 구간 = 프리미엄 매수 최적
+
+
+### LAYER 1 — 플로우 디스커버리 (1 call)
+
 ```
-get_historical_stock_prices(ticker, period="1d", interval="5m")
+get_flow_alerts()
 ```
-VWAP = Σ(price × volume) / Σ(volume) over the session.
 
-**Bullish Signal Score** (0–5 pts):
-- +1: MA1 > MA2 > MA5 (short-term bullish alignment)
-- +1: MA5 > MA20 (medium-term trend up)
-- +1: MACD line crossed above Signal line (last 3 bars)
-- +1: Price > VWAP (momentum confirmation)
-- +1: Volume today > 1.5× 5-day avg volume (institutional buying)
+→ 오늘 이상 옵션 플로우 발생 종목 전체 수신  
+→ 마스터 30종목과 교집합 추출  
+→ 프리미엄 $50k 이상 대형 주문 포함 종목 우선  
 
-**Bearish Signal Score** (0–5 pts, inverse of above)
+**이 한 번의 호출이 30종목 기술분석을 대체한다.**  
+결과: 오늘 집중할 종목 5~10개 도출
 
-**Threshold:** Score ≥ 3 → advance to Options Step.
+
+### LAYER 2 — 확신 스태킹 (관심 종목당 4 calls)
+
+```
+get_ticker_lit_flow(ticker)       → 콜/풋 방향 확인
+get_interval_flow(ticker)         → 플로우 가속 여부
+get_dark_pool_trades(ticker)      → 기관 블록 매수 존재?
+get_open_interest_changes(ticker) → 신규 포지션(확신) vs 청산
+```
+
+확신 점수 (0~4점):
+- lit_flow 방향 일치: +1
+- 플로우 가속 중: +1
+- 다크풀 같은 방향: +1
+- OI 급증 (+20%↑): +1
+
+**3점 이상만 다음 레이어로 진행**
+
+
+### LAYER 3 — 가격 레벨 인텔리전스 (확신 3점+ 종목당 3 calls)
+
+```
+get_greek_exposure_by_strike(ticker, expiry)
+get_max_pain(ticker, expiry)
+get_dark_pool_volume_price_group(ticker)
+```
+
+도출 정보:
+- **GEX 절벽**: 이 레벨 돌파 시 가격 가속 → 1차 타겟
+- **GEX 벽**: 저항/지지로 작동하는 레벨
+- **맥스페인**: 현재가 > 맥스페인 → CALL 유리 / 아래 → PUT 유리
+- **다크풀 집중 레벨**: 기관 평단가 = 실질 지지선 → 진입 기준점
+
+
+### LAYER 4 — 기술적 확인 (종목당 2 calls)
+
+```
+get_ticker_indicator_events(ticker)        → MA/MACD 크로스오버 이벤트
+get_extended_technical_indicator(ticker)   → VWAP, 볼린저밴드
+```
+
+플로우 방향과 기술적 방향이 일치 → 확신 추가  
+불일치 → 경고 플래그 (진입 보류 고려)
+
+
+### LAYER 5 — 리스크 게이트 (global 1 call + 종목당 1 call)
+
+```
+get_upcoming_earnings()               → 10일 이내 실적 → 즉시 제외
+get_short_data_by_ticker(ticker)      → 공매도 비율 확인
+```
+
+공매도 비율 > 20% + 불리시 플로우 = 숏 스퀴즈 잠재력 → 콜 매수 추가 근거
+
+
+### LAYER 6 — 계약 선정 (최종 후보 종목당 최대 6 calls)
+
+```
+get_flow_per_expiry(ticker)           → 스마트머니가 선택한 만기
+get_flow_per_strike(ticker)           → 스마트머니가 베팅한 행사가
+get_options_chain(ticker, W+2_expiry) → 체인 상세
+get_options_chain(ticker, W+3_expiry)
+get_options_chain(ticker, W+4_expiry)
+```
+
+**행사가 선택 우선순위:**
+1. 플로우 집중 행사가 = GEX 절벽 행사가 (최강)
+2. 플로우 집중 행사가 단독
+3. GEX 절벽 기반 ATM+5%
+
+**만기 선택:**
+- 플로우가 W+2에 집중 → W+2 (모멘텀 강할 때)
+- 기본값 → W+3 (균형)
+- 이벤트 대기 → W+4 (시간 여유)
+
+**계약 필터:**
+- 델타: 0.30 ~ 0.55
+- 스프레드율: < 10%
+- Vol/OI: > 0.1
+- IV: < 35% (프리미엄 매수이므로 저렴할 때)
+
+
+### LAYER 7 — 리포트 생성 & 발송
+
+5섹션 리포트 조립 후 `KakaotalkChat-MemoChat`으로 요약 발송
 
 ---
 
-### Step 2 — Earnings & News Filter
-
-```
-get_finance_news(ticker)
-get_stock_info(ticker)  → earningsDate field
-```
-
-- **SKIP** any ticker with earnings within 10 calendar days (avoid IV crush risk)
-- Flag tickers with analyst upgrades/downgrades in past 3 days (catalyst)
-- Flag tickers with major news (M&A, FDA, macro event)
-
----
-
-### Step 3 — Options Chain Analysis
-
-```
-get_option_expiration_dates(ticker)  → find W+2, W+3, W+4 dates
-get_option_chain(ticker, expiration_date, option_type)  → calls or puts
-```
-
-**Expiration Targeting:**
-- Today = T. Target expirations at T+10 to T+28 days
-- Select 2–3 expirations: closest weekly (W+2), mid (W+3), far (W+4)
-- Prefer Fridays (standard weekly expiration)
-
-**Strike Selection:**
-- Focus on **ATM to 5% OTM** strikes for directional premium plays
-- Target delta range: **0.30 – 0.55** (balance of probability vs leverage)
-
-**Option Scoring per contract** (see `references/scoring-model.md`):
-- IV Rank check: buy when IV < 30th percentile (cheap premium)
-- Bid-ask spread < 10% of mid price (liquidity OK)
-- Volume/OI ratio > 0.1 (active contract)
-- Premium vs max loss ratio
-
----
-
-### Step 4 — Report Assembly
-
-Compile all data into the Daily Report format (see below).
-
-Deliver via:
-1. `KakaotalkChat-MemoChat` — summary version (top 5 picks)
-2. Full markdown report saved to file / returned in conversation
-
----
-
-## Daily Report Format (5-Section Standard)
+## 5-Section Daily Report
 
 ```
 ═══════════════════════════════════════════════════
- OPTIONS DAILY REPORT — {YYYY-MM-DD}  {HH:MM ET}
- 전략: W+2~W+4 프리미엄 매수 | 보유기간: 1주 이내
+ OPTIONS DAILY REPORT — {DATE}  {TIME} ET
+ 전략: W+2~W+4 프리미엄 매수 | 보유: 1주 이내
 ═══════════════════════════════════════════════════
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SECTION 1: 시장 환경
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — 시장 환경
+─────────────────────────────────────────────────
+GEX (SPY): [+$XXXm 양수 | -$XXXm 음수]
+환경 판정: [변동성 억제 구간 | 방향성 폭발 구간]
+Market Maker 헷지 방향: [매수 | 매도]
+VIX: XX.X | 선물: ES ±X% | NQ ±X%
+오늘 전략: [CALL 풀사이즈 | PUT 풀사이즈 | 50% 축소 | 보류]
 
-GEX 환경: [양(+) / 음(-)]
-  양수 GEX: 마켓메이커가 헷지 매수 → 주가 안정화 구간 (변동성 낮음)
-  음수 GEX: 마켓메이커가 헷지 매도 → 주가 가속 구간 (변동성 확대)
-  현재값: +XXXm / -XXXm
+SECTION 2 — Market Tide 방향
+─────────────────────────────────────────────────
+콜 프리미엄: $XXXm | 풋 프리미엄: $XXXm
+콜/풋 비율: X.XX
+센티먼트: [BULLISH ↑ | BEARISH ↓ | NEUTRAL →]
+오늘 전략 방향: [CALL 집중 | PUT 집중 | 선별적]
 
-  → 음수 GEX 구간 = 방향성 옵션 매수 최적 환경
-  → 양수 GEX 구간 = 스프레드 전략 고려
-
-선물: ES +X.X% | NQ +X.X% | RTY +X.X%
-VIX: XX.X (전일 대비 ±X.X)
-장 상태: [REGULAR / PRE-MARKET / POST-MARKET]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SECTION 2: Market Tide 방향
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Market Tide: [BULLISH / BEARISH / NEUTRAL]
-
-콜 프리미엄 총액: $XXXm
-풋 프리미엄 총액: $XXXm
-콜/풋 비율: X.XX (1.0 이상 = 콜 우세)
-
-해석:
-  콜/풋 > 1.3 → 강한 불리시 센티먼트 → CALL 매수 적극
-  콜/풋 < 0.7 → 강한 베어리시 센티먼트 → PUT 매수 적극
-  0.7 ~ 1.3  → 혼재 → 개별 종목 시그널 우선
-
-오늘 전략 방향: [CALL 집중 / PUT 집중 / 혼재-선별적]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SECTION 3: 옵션 플로우 Top 20
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-오늘 가장 큰 이상 플로우가 감지된 종목 순위
-(출처: get_flow_alerts + get_ticker_lit_flow)
-
-| 순위 | 티커 | 플로우 방향 | 프리미엄 규모 | 만기 집중 | OI 변화 | 다크풀 | 기술 점수 | 종합 |
-|------|------|-----------|-------------|---------|---------|--------|----------|------|
-|  1 | NVDA | CALL ↑↑↑ | $XXXk       | W+3     | +XX%    | 매수  | 5/5      | ★★★★★ |
-|  2 | TSLA | PUT  ↓↓  | $XXXk       | W+2     | +XX%    | 중립  | 4/5      | ★★★★☆ |
-|  3 | AAPL | CALL ↑   | $XXXk       | W+4     | +X%     | 매수  | 4/5      | ★★★★☆ |
+SECTION 3 — 옵션 플로우 Top 20
+─────────────────────────────────────────────────
+순위 | 티커 | 방향  | 대형주문 | OI변화 | 다크풀 | 확신
+  1  | NVDA | CALL↑ | $XXXk   | +XX%   | 매수  | ●●●●
+  2  | TSLA | PUT↓  | $XXXk   | +XX%   | 중립  | ●●●○
 ...
-| 20 | DIS  | CALL ↑   | $XXk        | W+3     | +X%     | 중립  | 3/5      | ★★★☆☆ |
+ 20  | AAPL | CALL↑ | $XXk    | +X%    | 매수  | ●●○○
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SECTION 4: 콜/풋 추천 + 행사가격 (Top 5 핵심 픽)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — 콜/풋 추천 + 행사가격
+─────────────────────────────────────────────────
+### CALL PICK #1 — NVDA [확신 ●●●●]
 
-### CALL PICK #1 — NVDA [★★★★★ TIER 1]
-
-현재가: $XXX.XX | GEX 절벽: $XXX (위 돌파시 가속)
-맥스페인(W+3): $XXX → 현재가가 맥스페인 위 → CALL 유리
-
-기술: MA5>MA20 ✓ | MACD 골든크로스 ✓ | VWAP 상단 ✓
-플로우: 콜 $XXXk (대형 주문 포함) | OI +XX%
-다크풀: $XXX 레벨에서 기관 매집 확인
+현재가: $XXX.XX
+GEX 절벽(1차 타겟): $XXX  [돌파시 $XXX까지 가속]
+다크풀 지지선: $XXX  [기관 평단가, 진입 기준]
+맥스페인 W+3: $XXX  [현재가 > 맥스페인 → CALL 유리]
 
 추천 계약:
-| 만기     | 행사가  | 프리미엄 | 델타 | IV  | 선택 이유 |
-|---------|--------|---------|------|-----|---------|
-| W+2 MM/DD | $XXX C | $X.XX | 0.45 | 24% | 최대 레버리지, 강한 모멘텀 |
-| W+3 MM/DD | $XXX C | $X.XX | 0.40 | 23% | [추천] 균형, 플로우 집중 만기 |
-| W+4 MM/DD | $XXX C | $X.XX | 0.35 | 22% | 보수적, 시간 여유 |
+만기       | 행사가  | 프리미엄 | 델타 | IV  | 선택 근거
+W+2 MM/DD | $XXX C | $X.XX   | 0.45 | 24% | 플로우 집중 만기
+W+3 MM/DD | $XXX C | $X.XX   | 0.40 | 23% | [기본 추천] GEX 절벽 근처
+W+4 MM/DD | $XXX C | $X.XX   | 0.35 | 22% | 보수적
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SECTION 5: 손익분기 / 타겟 / 손절
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+### PUT PICK #1 — TSLA [확신 ●●●○]
+(동일 포맷)
 
-### NVDA — W+3 $XXX Call @ $X.XX 프리미엄 기준
-
-손익분기 (BEP):
-  주가 BEP = 행사가 + 프리미엄 = $XXX + $X.XX = $XXX.XX
-  현재가 대비: +X.X% 상승 필요
-
-타겟 (청산 목표):
-  1차 목표: 프리미엄 +50% → $X.XX | 주가 $XXX.XX 도달시
-  2차 목표: 프리미엄 +80% → $X.XX | 주가 $XXX.XX 도달시
-  GEX 절벽 돌파시 추가 보유 가능
-
-손절 기준:
-  프리미엄 손실 -40% → $X.XX 이하 청산
-  기술 역전 (MACD 데드크로스 or 가격 VWAP 하향 이탈)
-  만기 3일 전 잔량 전량 청산
-
-리스크/리워드:
-  최대 손실: $X.XX (프리미엄 전액)
-  1차 목표: +$X.XX | R/R = 1:1.25
-  2차 목표: +$X.XX | R/R = 1:2.0
-
-진입 타이밍:
-  장 시작 후 15분 대기 (가격 안정 확인)
-  VWAP 위에서 확인 후 진입
-  다크풀 집중 가격대 ($XXX) 지지 확인
-
+SECTION 5 — 손익분기 / 타겟 / 손절
 ─────────────────────────────────────────────────
-### [PUT PICK 동일 포맷 반복]
-─────────────────────────────────────────────────
+NVDA W+3 $XXX Call @ $X.XX 프리미엄:
 
-⚠️  실적 경고: {TICKER} — MM/DD 실적 발표 (진입 금지)
-⚠️  이벤트: {이벤트명} — 포지션 사이즈 축소 권고
+손익분기(BEP): $XXX + $X.XX = $XXX.XX (현재 대비 +X.X%)
+1차 타겟:      $XXX (GEX 절벽) → 프리미엄 +50~60% 예상
+2차 타겟:      $XXX (절벽 돌파 후) → 프리미엄 +80~120% 예상
+손절:          프리미엄 -40% OR 다크풀 지지 $XXX 이탈
+시간 손절:     만기 3일 전 잔량 전량 청산
+R/R:           1차 기준 1:1.4 / 2차 기준 1:2.2
+
+진입 조건:
+  · 장 시작 15분 후 (가격 안정 확인)
+  · 현재가 > VWAP 확인 (콜 기준)
+  · 다크풀 지지 $XXX 위에서 진입
+
+⚠️ 실적 경고: [해당 없음 | TICKER MM/DD — 진입 금지]
 
 ═══════════════════════════════════════════════════
- 생성: {TIMESTAMP} ET | 다음: 익일 09:00 ET
+생성: {TIMESTAMP} ET | 다음: 익일 09:00 ET
 ═══════════════════════════════════════════════════
 ```
 
 ---
 
-## Execution Instructions
+## 총 MCP 호출 수
 
-When user says "옵션 리포트 실행" or "run options report":
+| 레이어 | 호출수 |
+|--------|--------|
+| Layer 0: 시장 레짐 | 4 |
+| Layer 1: 플로우 디스커버리 | 1 |
+| Layer 2: 확신 스태킹 × 8종목 | 32 |
+| Layer 3: 가격 레벨 × 5종목 | 15 |
+| Layer 4: 기술 확인 × 5종목 | 10 |
+| Layer 5: 리스크 게이트 | 6 |
+| Layer 6: 계약 선정 × 5종목 | 30 |
+| **합계** | **~98 calls** |
 
-1. Get today's date, calculate W+2/W+3/W+4 Friday dates
-2. Loop through all 30 tickers in `references/ticker-master.md`
-3. For each ticker: fetch prices → calculate indicators → score
-4. Fetch news + earnings for scored tickers (≥3)
-5. For qualified tickers: fetch option chains for each target expiration
-6. Score and rank options contracts
-7. Assemble report in the format above
-8. Send summary to KakaoTalk via `KakaotalkChat-MemoChat`
-9. Return full report in conversation
+---
 
-**Performance tip:** Batch tickers in groups of 5 to avoid rate limits. Start with high-conviction names (NVDA, TSLA, AAPL, QQQ, SPY).
+## 트리거
+
+"옵션 리포트 실행" 또는 "run options report" 또는 "daily scan" 입력 시:
+1. Layer 0~7 순서대로 실행
+2. 5섹션 리포트 전체 출력
+3. KakaoTalk으로 섹션 1~3 요약 발송
